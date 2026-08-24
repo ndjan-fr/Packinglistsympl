@@ -9,6 +9,7 @@ Required environment variables (GitHub Secrets):
   CALENDLY_TOKEN       — Calendly personal access token
   SYMPL_EMAIL          — mdjan@sympl.fr
   SYMPL_PASSWORD       — mD411062++!!
+  SHEETS_WEBHOOK_URL   — Google Apps Script webhook URL
 """
 
 import os
@@ -32,6 +33,8 @@ SYMPL_EMAIL     = os.environ["SYMPL_EMAIL"]
 SYMPL_PASSWORD  = os.environ["SYMPL_PASSWORD"]
 SYMPL_BASE      = "https://live.sympl.fr"
 WINDOW_HOURS    = 24
+SHEETS_WEBHOOK_URL = os.environ.get("SHEETS_WEBHOOK_URL", "")
+SHEETS_SECRET      = "sympl-packing-list-2024"
 
 # Classique template column headers (required by sympl.fr)
 CLASSIQUE_HEADERS = [
@@ -284,6 +287,41 @@ def create_reception(session, company_id, data, delivery_date, packing_list_url)
         raise ValueError(f"Reception creation failed. URL: {r2.url}. Errors: {ep.errors[:3]}")
 
 
+# ── Google Sheets logging ───────────────────────────────────────────────────────
+def log_to_sheets(data, reception_id):
+    """Send a row to the Google Sheets webhook (Apps Script doPost)."""
+    if not SHEETS_WEBHOOK_URL:
+        log.warning("SHEETS_WEBHOOK_URL not set — skipping Sheets logging")
+        return
+    payload = {
+        "secret": SHEETS_SECRET,
+        "date_soumission":      datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M"),
+        "societe":              data.get("societe", ""),
+        "contact":              data.get("contact", ""),
+        "email":                data.get("email", ""),
+        "telephone":            data.get("telephone", ""),
+        "reference":            data.get("reference", ""),
+        "transporteur":         data.get("transporteur", ""),
+        "numero_suivi":         data.get("numero_suivi", ""),
+        "nombre_palettes":      data.get("nombre_palettes", ""),
+        "cartons_palette":      data.get("cartons_palette", ""),
+        "cartons_vrac":         data.get("cartons_vrac", ""),
+        "format":               data.get("format", "classique"),
+        "commentaires":         data.get("commentaires", ""),
+        "fichier_packing_list": data.get("fichier_packing_list", ""),
+        "reception_id":         str(reception_id),
+    }
+    try:
+        r = requests.post(SHEETS_WEBHOOK_URL, json=payload, timeout=15)
+        result = r.json()
+        if result.get("status") == "ok":
+            log.info(f"Logged to Google Sheets (reception #{reception_id})")
+        else:
+            log.warning(f"Sheets webhook returned: {result}")
+    except Exception as e:
+        log.warning(f"Could not log to Google Sheets: {e}")
+
+
 # ── Main ────────────────────────────────────────────────────────────────────────
 def main():
     log.info("=== Packing list automation starting ===")
@@ -312,11 +350,11 @@ def main():
         # 3. Anti-duplicate check
         company_id = get_company_id(company_name, email_domain)
         if company_id is None:
-            log.error(f"❌ Company not found for '{company_name}' ({email}). Manual action required.")
+            log.error(f"Company not found for '{company_name}' ({email}). Manual action required.")
             continue
 
         if check_reception_exists(sympl, company_id, reference):
-            log.warning(f"⚠️ Reception already exists for {company_name} ref {reference}. Skipping.")
+            log.warning(f"Reception already exists for {company_name} ref {reference}. Skipping.")
             continue
 
         # 4. Get Calendly delivery date
@@ -326,7 +364,7 @@ def main():
         else:
             # Fallback: use form date
             delivery_date = d.get("date_livraison", "")
-            log.warning(f"⚠️ No Calendly event found for {email}. Using form date: {delivery_date}")
+            log.warning(f"No Calendly event found for {email}. Using form date: {delivery_date}")
 
         # 5. Create reception
         try:
@@ -334,14 +372,17 @@ def main():
                 sympl, company_id, d, delivery_date,
                 d.get("fichier_packing_list", "")
             )
-            log.info(f"✅ Reception #{reception_id} created for {company_name} ref {reference}")
+            log.info(f"Reception #{reception_id} created for {company_name} ref {reference}")
 
-            # 6. Delete Netlify submission
+            # 6. Log to Google Sheets
+            log_to_sheets(d, reception_id)
+
+            # 7. Delete Netlify submission
             delete_submission(sub["id"])
             processed += 1
 
         except Exception as e:
-            log.error(f"❌ Failed to create reception for {company_name}: {e}")
+            log.error(f"Failed to create reception for {company_name}: {e}")
 
     log.info(f"=== Done: {processed}/{len(submissions)} submissions processed ===")
 
