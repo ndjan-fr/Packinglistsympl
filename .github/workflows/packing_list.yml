@@ -30,4 +30,5 @@ jobs:
           CALENDLY_TOKEN:  ${{ secrets.CALENDLY_TOKEN }}
           SYMPL_EMAIL:     ${{ secrets.SYMPL_EMAIL }}
           SYMPL_PASSWORD:  ${{ secrets.SYMPL_PASSWORD }}
+          SHEETS_WEBHOOK_URL: ${{ secrets.SHEETS_WEBHOOK_URL }}
         run: python packing_list_automation.py
