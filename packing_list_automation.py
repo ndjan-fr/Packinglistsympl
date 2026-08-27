@@ -7,10 +7,11 @@ Required environment variables (GitHub Secrets):
 NETLIFY_TOKEN — Netlify personal access token
 NETLIFY_SITE_ID — Netlify site ID
 CALENDLY_TOKEN — Calendly personal access token
-SYMPL_EMAIL — sympl.fr login email
-SYMPL_PASSWORD — sympl.fr login password
+SYMPL_EMAIL ~} sympl.fr login email
+SYMPL_PASSWORD ~} sympl.fr login password
 GOOGLE_CREDENTIALS — JSON content of the service account key file
-GOOGLE_SHEET_ID — Google Sheet ID for logging
+GOOGLE_SHEET_ID ~} Google Sheet ID for logging
+GOOGLE_DRIVE_FOLDER_ID ~} Google Drive folder ID for packing list files
 """
 
 import os
@@ -21,14 +22,18 @@ import tempfile
 from datetime import datetime, timezone, timedelta
 
 import requests
-from openpyxl import Workbook
+from openxl import Workbook
 import gspread
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
+import io
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Config ─────────────────────────────────────────────────────────────────────
+# ─── Config ─────────────────────────────────────────────────────────────────────────────�
+
 NETLIFY_TOKEN = os.environ["NETLIFY_TOKEN"]
 NETLIFY_SITE_ID = os.environ.get("NETLIFY_SITE_ID", "f9550cb4-bc9c-4105-a009-f54324835a11")
 NETLIFY_FORM = "packing-list"
@@ -39,13 +44,14 @@ SYMPL_BASE = "https://live.sympl.fr"
 WINDOW_HOURS = 24
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "1Af1EKPb69bjRfnrUREWDZ3Ckt6F1-qSbasQ0hxxcYnY")
+GOOGLE_DRIVE_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "1t892td9BT0JFBnS4DpwZ3Qk-mEWY_bNn")
 
 # Classique template column headers (required by sympl.fr)
 CLASSIQUE_HEADERS = [
     "Code-barres", "Quantite", "Nom", "Reference", "Couleur", "Taille",
     "Type de code barre", "Assurance", "Composition", "Valeur",
     "Pays d'origine", "Code SH", "Imei", "Lot",
-    "Date d'expiration (au format JJ/MM/AAAA)", "Quantite buffer",
+    "Date d'expiration (au format JJ/xMM/AAAA)", "Quantite buffer",
 ]
 
 # Company name -> companyId lookup table
@@ -54,19 +60,79 @@ COMPANY_TABLE = {
     "ATELIER MATERI": 1760, "BIBI": 1859, "BTLC": 1747, "ECOJOKO": 1615,
     "FEMPO": 1829, "FORLIFE": 1639, "FRENCH PALS": 1814, "GEEK STORE": 481,
     "KALIOS": 1838, "KUMIKO MATCHA": 1213, "LE DOSE CLUB": 1864,
-    "MAISON MATINE": 1830, "PANAME COLLECTIONS": 307, "RED ART GAMES": 1576,
+    "MAISON MATINE": 1830, "PANAME COLLECTB��8�00� "REDART @�MES ��1576,
     "SAEVE": 1388, "SHATELY": 396, "SISTERS REPUBLIC": 1544, "SYMPL": 1,
     "THE7CGROUP": 1999, "THE ENTHUSIASTS": 1813, "URBAN DIET": 1378,
     "VERRE&IMAGE": 63,
 }
 
-# ── Google Sheets ───────────────────────────────────────────────────────────────
+# ──── Google Sheets ──────────────────────────────────────────────────────────────────�
+
 SHEET_HEADERS = [
     "Date soumission", "Societe", "Contact", "Email", "Telephone",
     "Reference", "Transporteur", "N suivi", "Nb palettes",
     "Cartons/palette", "Cartons vrac", "Format", "Commentaires",
     "Fichier packing list", "ID reception",
 ]
+
+def get_drive_service():
+    if not GOOGLE_CREDENTIALS:
+        return None
+    try:
+        creds_dict = json.loads(GOOGLE_CREDENTIALS)
+        scopes = [
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        return build("drive", "v3", credentials=creds)
+    except Exception as e:
+        log.warning(f"Could not initialize Drive service: {e}")
+        return None
+
+def upload_to_drive(file_url, company_name, reference):
+    """Download file from Netlify URL and upload to Google Drive. Returns Drive file URL or None."""
+    if not file_url:
+        return None
+    service = get_drive_service()
+    if not service:
+        log.warning("Drive service unavailable — skipping file upload")
+        return None
+    try:
+        r = requests.get(file_url, timeout=60)
+        r.raise_for_status()
+        content_type = r.headers.get("Content-Type", "application/octet-stream").split(";")[0]
+        # Determine extension from content type or URL
+        ext_map = {
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+            "application/pdf": ".pdf",
+            "text/csv": ".csv",
+            "application/zip": ".zip",
+        }
+        ext = ext_map.get(content_type, "")
+        if not ext:
+            url_path = file_url.split("?")[0]
+            if "." in url_path.split("/")[-1]:
+                ext = "." + url_path.split("/")[-1].rsplit(".", 1)[-1]
+        date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+        safe_company = company_name.replace(" ", "_").replace("/", "-")[:30]
+        safe_ref = reference.replace(" ", "_").replace("/", "-")[:20]
+        filename = f"{safe_company}_{safe_ref}_{date_str}{ext}"
+        file_metadata = {
+            "name": filename,
+            "parents": [GOOGLE_DRIVE_FOLDER_ID],
+        }
+        media = MediaIoBaseUpload(io.BytesIO(r.content), mimetype=content_type)
+        uploaded = service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields="id, webViewLink",
+        ).execute()
+        drive_url = uploaded.get("webViewLink", "")
+        log.info(f"Uploaded to Drive: {filename} → {drive_url}")
+        return drive_url
+    except Exception as e:
+        log.warning(f"Could not upload file to Drive: {e}")
+        return None
 
 def get_sheets_client():
     if not GOOGLE_CREDENTIALS:
@@ -92,7 +158,7 @@ def ensure_sheet_headers(worksheet):
     except Exception as e:
         log.warning(f"Could not check/set headers: {e}")
 
-def log_to_sheets(data, reception_id):
+def log_to_sheets(data, reception_id, drive_url=None):
     client = get_sheets_client()
     if not client:
         log.warning("GOOGLE_CREDENTIALS not set or invalid -- skipping Sheets logging")
@@ -115,7 +181,7 @@ def log_to_sheets(data, reception_id):
             str(data.get("cartons_vrac", "")),
             data.get("format", "classique"),
             data.get("commentaires", ""),
-            data.get("fichier_packing_list", ""),
+            drive_url or data.get("fichier_packing_list", ""),
             str(reception_id),
         ]
         worksheet.append_row(row, value_input_option="USER_ENTERED")
@@ -123,7 +189,7 @@ def log_to_sheets(data, reception_id):
     except Exception as e:
         log.warning(f"Could not log to Google Sheets: {e}")
 
-# ── Netlify ─────────────────────────────────────────────────────────────────────
+# ─── Netlify ────────────────────────────────────────────────────────────────────────────
 def netlify_headers():
     return {"Authorization": f"Bearer {NETLIFY_TOKEN}"}
 
@@ -161,7 +227,7 @@ def delete_submission(submission_id):
     r.raise_for_status()
     log.info(f"Deleted Netlify submission {submission_id}")
 
-# ── Calendly ────────────────────────────────────────────────────────────────────
+# ─── Calendly ────────────────────────────────────────────────────────────────────────────
 def get_calendly_user():
     r = requests.get(
         "https://api.calendly.com/users/me",
@@ -192,9 +258,9 @@ def find_calendly_event(email, reference):
             continue
         inv_r = requests.get(
             f"https://api.calendly.com/scheduled_events/{event['uri'].split('/')[-1]}/invitees",
-            headers={"Authorization": f"Bearer {CALENDLY_TOKEN}"}, timeout=30
+            headers={"Authorization": f"Bearer {CALENDRY_TOKEN}"}, timeout=30
         )
-        if inv_r.status_code != 200:
+        if inr_r.status_code != 200:
             continue
         for invitee in inv_r.json().get("collection", []):
             q_text = " ".join(
@@ -206,7 +272,8 @@ def find_calendly_event(email, reference):
                 return dt.strftime("%d/%m/%Y")
     return None
 
-# ── sympl.fr session ────────────────────────────────────────────────────────────
+# ──── sympl.fr session ────────────────────────────────────────────────────────────────────�
+
 def sympl_login():
     s = requests.Session()
     s.headers.update({"User-Agent": "Mozilla/5.0 (compatible; packing-list-bot/1.0)"})
@@ -230,7 +297,7 @@ def sympl_login():
         "password": SYMPL_PASSWORD,
     }, allow_redirects=True, timeout=30)
     if "/login" in r2.url:
-        raise ValueError("sympl.fr login failed -- check credentials")
+        raise ValueError("Sympl.fr login failed -- check credentials")
     log.info("sympl.fr login successful")
     return s
 
@@ -338,7 +405,8 @@ def create_reception(session, company_id, data, delivery_date, packing_list_url)
         ep.feed(r2.text)
         raise ValueError(f"Reception creation failed. URL: {r2.url}. Errors: {ep.errors[:3]}")
 
-# ── Main ────────────────────────────────────────────────────────────────────────
+# ─── Main ────────────────────────────────────────────────────────────────────────────────�
+
 def main():
     log.info("=== Packing list automation starting ===")
 
@@ -384,7 +452,11 @@ def main():
             )
             log.info(f"Reception #{reception_id} created for {company_name} ref {reference}")
 
-            log_to_sheets(d, reception_id)
+            drive_url = upload_to_drive(
+                d.get("fichier_packing_list", ""),
+                company_name, reference
+            )
+            log_to_sheets(d, reception_id, drive_url=drive_url)
             delete_submission(sub["id"])
             processed += 1
 
@@ -392,6 +464,7 @@ def main():
             log.error(f"Failed to create reception for {company_name}: {e}")
 
     log.info(f"=== Done: {processed}/{len(submissions)} submissions processed ===")
+
 
 if __name__ == "__main__":
     main()
