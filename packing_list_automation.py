@@ -4,47 +4,51 @@ Packing List Automation — sympl.fr
 Runs hourly via GitHub Actions. No browser needed.
 
 Required environment variables (GitHub Secrets):
-  NETLIFY_TOKEN        — Netlify personal access token
-  NETLIFY_SITE_ID      — f9550cb4-bc9c-4105-a009-f54324835a11
-  CALENDLY_TOKEN       — Calendly personal access token
-  SYMPL_EMAIL          — mdjan@sympl.fr
-  SYMPL_PASSWORD       — mD411062++!!
-  SHEETS_WEBHOOK_URL   — Google Apps Script webhook URL
+NETLIFY_TOKEN — Netlify personal access token
+NETLIFY_SITE_ID — Netlify site ID
+CALENDLY_TOKEN — Calendly personal access token
+SYMPL_EMAIL — sympl.fr login email
+SYMPL_PASSWORD — sympl.fr login password
+GOOGLE_CREDENTIALS — JSON content of the service account key file
+GOOGLE_SHEET_ID — Google Sheet ID for logging
 """
 
 import os
 import sys
 import json
 import logging
+import tempfile
 from datetime import datetime, timezone, timedelta
 
 import requests
 from openpyxl import Workbook
+import gspread
+from google.oauth2.service_account import Credentials
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-NETLIFY_TOKEN   = os.environ["NETLIFY_TOKEN"]
+NETLIFY_TOKEN = os.environ["NETLIFY_TOKEN"]
 NETLIFY_SITE_ID = os.environ.get("NETLIFY_SITE_ID", "f9550cb4-bc9c-4105-a009-f54324835a11")
-NETLIFY_FORM    = "packing-list"
-CALENDLY_TOKEN  = os.environ["CALENDLY_TOKEN"]
-SYMPL_EMAIL     = os.environ["SYMPL_EMAIL"]
-SYMPL_PASSWORD  = os.environ["SYMPL_PASSWORD"]
-SYMPL_BASE      = "https://live.sympl.fr"
-WINDOW_HOURS    = 24
-SHEETS_WEBHOOK_URL = os.environ.get("SHEETS_WEBHOOK_URL", "")
-SHEETS_SECRET      = "sympl-packing-list-2024"
+NETLIFY_FORM = "packing-list"
+CALENDLY_TOKEN = os.environ["CALENDLY_TOKEN"]
+SYMPL_EMAIL = os.environ["SYMPL_EMAIL"]
+SYMPL_PASSWORD = os.environ["SYMPL_PASSWORD"]
+SYMPL_BASE = "https://live.sympl.fr"
+WINDOW_HOURS = 24
+GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "")
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "1Af1EKPb69bjRfnrUREWDZ3Ckt6F1-qSbasQ0hxxcYnY")
 
 # Classique template column headers (required by sympl.fr)
 CLASSIQUE_HEADERS = [
-    "Code-barres", "Quantité", "Nom", "Reference", "Couleur", "Taille",
+    "Code-barres", "Quantite", "Nom", "Reference", "Couleur", "Taille",
     "Type de code barre", "Assurance", "Composition", "Valeur",
     "Pays d'origine", "Code SH", "Imei", "Lot",
-    "Date d'expiration (au format JJ/MM/AAAA)", "Quantité buffer",
+    "Date d'expiration (au format JJ/MM/AAAA)", "Quantite buffer",
 ]
 
-# Company name → companyId lookup table (partial — extended as needed)
+# Company name -> companyId lookup table
 COMPANY_TABLE = {
     "23 HEURES 59 EDITIONS": 1284, "AGAIN": 1911, "AKOR": 1275, "ASPHALTE": 358,
     "ATELIER MATERI": 1760, "BIBI": 1859, "BTLC": 1747, "ECOJOKO": 1615,
@@ -54,9 +58,70 @@ COMPANY_TABLE = {
     "SAEVE": 1388, "SHATELY": 396, "SISTERS REPUBLIC": 1544, "SYMPL": 1,
     "THE7CGROUP": 1999, "THE ENTHUSIASTS": 1813, "URBAN DIET": 1378,
     "VERRE&IMAGE": 63,
-    # Add more as needed — full list in the skill SKILL.md
 }
 
+# ── Google Sheets ───────────────────────────────────────────────────────────────
+SHEET_HEADERS = [
+    "Date soumission", "Societe", "Contact", "Email", "Telephone",
+    "Reference", "Transporteur", "N suivi", "Nb palettes",
+    "Cartons/palette", "Cartons vrac", "Format", "Commentaires",
+    "Fichier packing list", "ID reception",
+]
+
+def get_sheets_client():
+    if not GOOGLE_CREDENTIALS:
+        return None
+    try:
+        creds_dict = json.loads(GOOGLE_CREDENTIALS)
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        return gspread.authorize(creds)
+    except Exception as e:
+        log.warning(f"Could not initialize Google Sheets client: {e}")
+        return None
+
+def ensure_sheet_headers(worksheet):
+    try:
+        first_row = worksheet.row_values(1)
+        if first_row != SHEET_HEADERS:
+            worksheet.insert_row(SHEET_HEADERS, 1)
+            log.info("Sheet headers initialized")
+    except Exception as e:
+        log.warning(f"Could not check/set headers: {e}")
+
+def log_to_sheets(data, reception_id):
+    client = get_sheets_client()
+    if not client:
+        log.warning("GOOGLE_CREDENTIALS not set or invalid -- skipping Sheets logging")
+        return
+    try:
+        sheet = client.open_by_key(GOOGLE_SHEET_ID)
+        worksheet = sheet.sheet1
+        ensure_sheet_headers(worksheet)
+        row = [
+            datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M"),
+            data.get("societe", ""),
+            data.get("contact", ""),
+            data.get("email", ""),
+            data.get("telephone", ""),
+            data.get("reference", ""),
+            data.get("transporteur", ""),
+            data.get("numero_suivi", ""),
+            str(data.get("nombre_palettes", "")),
+            str(data.get("cartons_palette", "")),
+            str(data.get("cartons_vrac", "")),
+            data.get("format", "classique"),
+            data.get("commentaires", ""),
+            data.get("fichier_packing_list", ""),
+            str(reception_id),
+        ]
+        worksheet.append_row(row, value_input_option="USER_ENTERED")
+        log.info(f"Logged to Google Sheets (reception #{reception_id})")
+    except Exception as e:
+        log.warning(f"Could not log to Google Sheets: {e}")
 
 # ── Netlify ─────────────────────────────────────────────────────────────────────
 def netlify_headers():
@@ -96,7 +161,6 @@ def delete_submission(submission_id):
     r.raise_for_status()
     log.info(f"Deleted Netlify submission {submission_id}")
 
-
 # ── Calendly ────────────────────────────────────────────────────────────────────
 def get_calendly_user():
     r = requests.get(
@@ -107,7 +171,6 @@ def get_calendly_user():
     return r.json()["resource"]["uri"]
 
 def find_calendly_event(email, reference):
-    """Find upcoming Réception de marchandises event matching email or reference."""
     user_uri = get_calendly_user()
     now = datetime.now(timezone.utc).isoformat()
     r = requests.get(
@@ -127,7 +190,6 @@ def find_calendly_event(email, reference):
     for event in events:
         if "livraison" not in event.get("name", "").lower():
             continue
-        # Fetch invitees to match by email
         inv_r = requests.get(
             f"https://api.calendly.com/scheduled_events/{event['uri'].split('/')[-1]}/invitees",
             headers={"Authorization": f"Bearer {CALENDLY_TOKEN}"}, timeout=30
@@ -144,12 +206,10 @@ def find_calendly_event(email, reference):
                 return dt.strftime("%d/%m/%Y")
     return None
 
-
 # ── sympl.fr session ────────────────────────────────────────────────────────────
 def sympl_login():
     s = requests.Session()
     s.headers.update({"User-Agent": "Mozilla/5.0 (compatible; packing-list-bot/1.0)"})
-    # Get login page to get CSRF token
     r = s.get(f"{SYMPL_BASE}/login", timeout=30)
     r.raise_for_status()
     from html.parser import HTMLParser
@@ -164,14 +224,13 @@ def sympl_login():
     p.feed(r.text)
     if not p.token:
         raise ValueError("Could not extract CSRF token from login page")
-    # Login
     r2 = s.post(f"{SYMPL_BASE}/login", data={
         "_token": p.token,
         "email": SYMPL_EMAIL,
         "password": SYMPL_PASSWORD,
     }, allow_redirects=True, timeout=30)
     if "/login" in r2.url:
-        raise ValueError("sympl.fr login failed — check credentials")
+        raise ValueError("sympl.fr login failed -- check credentials")
     log.info("sympl.fr login successful")
     return s
 
@@ -180,18 +239,15 @@ def check_reception_exists(session, company_id, reference):
         f"{SYMPL_BASE}/admin/stock/receptions",
         params={"reference": reference}, timeout=30
     )
-    return "Aucune réception n'a été trouvée" not in r.text
+    return "Aucune reception n'a ete trouvee" not in r.text
 
 def get_company_id(company_name, email_domain):
     name_upper = company_name.upper().strip()
-    # Direct match
     if name_upper in COMPANY_TABLE:
         return COMPANY_TABLE[name_upper]
-    # Partial match
     for k, v in COMPANY_TABLE.items():
         if k in name_upper or name_upper in k:
             return v
-    # Domain match
     for k, v in COMPANY_TABLE.items():
         if email_domain.lower() in k.lower():
             return v
@@ -203,14 +259,12 @@ def create_placeholder_xlsx():
     ws.title = "Feuil1"
     ws.append(CLASSIQUE_HEADERS)
     ws.append([""] * len(CLASSIQUE_HEADERS))
-    import tempfile, os
     tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
     wb.save(tmp.name)
     tmp.close()
     return tmp.name
 
 def create_reception(session, company_id, data, delivery_date, packing_list_url):
-    # Get create page for CSRF token
     r = session.get(
         f"{SYMPL_BASE}/admin/stock/receptions/create",
         params={"companyId": company_id}, timeout=30
@@ -229,7 +283,6 @@ def create_reception(session, company_id, data, delivery_date, packing_list_url)
     if not p.token:
         raise ValueError("Could not extract CSRF token from reception create page")
 
-    # Build placeholder xlsx file
     xlsx_path = create_placeholder_xlsx()
 
     description = data.get("commentaires") or (
@@ -240,7 +293,7 @@ def create_reception(session, company_id, data, delivery_date, packing_list_url)
     form_data = {
         "_token": p.token,
         "company_id": str(company_id),
-        "location_id": "4",  # MARLY1
+        "location_id": "4",
         "reference": data.get("reference", ""),
         "description": description,
         "carrier_name": data.get("transporteur", ""),
@@ -266,18 +319,17 @@ def create_reception(session, company_id, data, delivery_date, packing_list_url)
 
     os.unlink(xlsx_path)
 
-    if "réception a bien été créée" in r2.text or "/receptions/" in r2.url:
+    if "reception a bien ete creee" in r2.text or "/receptions/" in r2.url:
         reception_id = r2.url.split("/receptions/")[-1].split("?")[0] if "/receptions/" in r2.url else "?"
         log.info(f"Reception created: #{reception_id}")
         return reception_id
     else:
-        # Check for error
         from html.parser import HTMLParser
         class ErrParser(HTMLParser):
             errors = []
             def handle_starttag(self, tag, attrs):
                 d = dict(attrs)
-                if "alert" in d.get("class",""):
+                if "alert" in d.get("class", ""):
                     self._in_alert = True
             def handle_data(self, data):
                 if data.strip():
@@ -286,47 +338,10 @@ def create_reception(session, company_id, data, delivery_date, packing_list_url)
         ep.feed(r2.text)
         raise ValueError(f"Reception creation failed. URL: {r2.url}. Errors: {ep.errors[:3]}")
 
-
-# ── Google Sheets logging ───────────────────────────────────────────────────────
-def log_to_sheets(data, reception_id):
-    """Send a row to the Google Sheets webhook (Apps Script doPost)."""
-    if not SHEETS_WEBHOOK_URL:
-        log.warning("SHEETS_WEBHOOK_URL not set — skipping Sheets logging")
-        return
-    payload = {
-        "secret": SHEETS_SECRET,
-        "date_soumission":      datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M"),
-        "societe":              data.get("societe", ""),
-        "contact":              data.get("contact", ""),
-        "email":                data.get("email", ""),
-        "telephone":            data.get("telephone", ""),
-        "reference":            data.get("reference", ""),
-        "transporteur":         data.get("transporteur", ""),
-        "numero_suivi":         data.get("numero_suivi", ""),
-        "nombre_palettes":      data.get("nombre_palettes", ""),
-        "cartons_palette":      data.get("cartons_palette", ""),
-        "cartons_vrac":         data.get("cartons_vrac", ""),
-        "format":               data.get("format", "classique"),
-        "commentaires":         data.get("commentaires", ""),
-        "fichier_packing_list": data.get("fichier_packing_list", ""),
-        "reception_id":         str(reception_id),
-    }
-    try:
-        r = requests.post(SHEETS_WEBHOOK_URL, json=payload, timeout=15)
-        result = r.json()
-        if result.get("status") == "ok":
-            log.info(f"Logged to Google Sheets (reception #{reception_id})")
-        else:
-            log.warning(f"Sheets webhook returned: {result}")
-    except Exception as e:
-        log.warning(f"Could not log to Google Sheets: {e}")
-
-
 # ── Main ────────────────────────────────────────────────────────────────────────
 def main():
     log.info("=== Packing list automation starting ===")
 
-    # 1. Get Netlify submissions
     form_id = get_form_id()
     submissions = get_recent_submissions(form_id)
 
@@ -334,20 +349,18 @@ def main():
         log.info("No new submissions in the last 24h. Nothing to do.")
         return
 
-    # 2. Login to sympl.fr once
     sympl = sympl_login()
 
     processed = 0
     for sub in submissions:
         d = sub.get("data", {})
         company_name = d.get("societe", "")
-        reference    = d.get("reference", "")
-        email        = d.get("email", "")
+        reference = d.get("reference", "")
+        email = d.get("email", "")
         email_domain = email.split("@")[-1].split(".")[0] if "@" in email else ""
 
-        log.info(f"Processing: {company_name} — ref {reference}")
+        log.info(f"Processing: {company_name} -- ref {reference}")
 
-        # 3. Anti-duplicate check
         company_id = get_company_id(company_name, email_domain)
         if company_id is None:
             log.error(f"Company not found for '{company_name}' ({email}). Manual action required.")
@@ -357,16 +370,13 @@ def main():
             log.warning(f"Reception already exists for {company_name} ref {reference}. Skipping.")
             continue
 
-        # 4. Get Calendly delivery date
         delivery_date = find_calendly_event(email, reference)
         if delivery_date:
             log.info(f"Calendly date found: {delivery_date}")
         else:
-            # Fallback: use form date
             delivery_date = d.get("date_livraison", "")
             log.warning(f"No Calendly event found for {email}. Using form date: {delivery_date}")
 
-        # 5. Create reception
         try:
             reception_id = create_reception(
                 sympl, company_id, d, delivery_date,
@@ -374,10 +384,7 @@ def main():
             )
             log.info(f"Reception #{reception_id} created for {company_name} ref {reference}")
 
-            # 6. Log to Google Sheets
             log_to_sheets(d, reception_id)
-
-            # 7. Delete Netlify submission
             delete_submission(sub["id"])
             processed += 1
 
@@ -385,7 +392,6 @@ def main():
             log.error(f"Failed to create reception for {company_name}: {e}")
 
     log.info(f"=== Done: {processed}/{len(submissions)} submissions processed ===")
-
 
 if __name__ == "__main__":
     main()
