@@ -1,28 +1,21 @@
 name: Packing List Automation
-
 on:
   schedule:
-    # Every hour Mon-Fri 8h-18h Paris time (UTC+2 in summer = 6h-16h UTC)
-    - cron: '0 6-16 * * 1-5'  # Runs every hour, between 06:00 and 16:00, Monday through Friday
-  workflow_dispatch: # Allow manual trigger
-
+    - cron: '0 6-16 * * 1-5'
+  workflow_dispatch:
 jobs:
   process:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Install dependencies
-        run: pip install requests openpyxl gspread google-auth
-
+        run: pip install requests openpyxl gspread google-auth google-api-python-client
       - name: Run automation
         env:
           NETLIFY_TOKEN:    ${{ secrets.NETLIFY_TOKEN }}
